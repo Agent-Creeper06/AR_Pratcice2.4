@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>WebAR: размещение объекта (Three.js + WebXR hit-test)</title>
+
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; font-family: sans-serif; background: #101820; color: #fff; }
+    canvas { display: block; }
+
+    /* стартовый экран (до запуска AR) */
+    #start {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 5;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 16px; padding: 24px; box-sizing: border-box; text-align: center;
+    }
+    #startBtn {
+      padding: 16px 28px; font-size: 18px; border: 0; border-radius: 28px;
+      background: #00c2ff; color: #fff; cursor: pointer;
+    }
+    #startBtn:disabled { background: #555; cursor: default; }
+    #status { max-width: 420px; font-size: 14px; color: #ccc; }
+
+    /* интерфейс внутри AR-сессии (DOM overlay) */
+    #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: none; pointer-events: none; }
+    #hint {
+      position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+      padding: 8px 14px; border-radius: 16px; background: rgba(0,0,0,.6);
+      font-size: 14px; text-align: center; max-width: 90%;
+    }
+    #panel {
+      position: absolute; bottom: 20px; left: 0; width: 100%;
+      display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; padding: 0 8px; box-sizing: border-box;
+    }
+    #panel button {
+      pointer-events: auto; padding: 12px 16px; border: 0; border-radius: 20px;
+      font-size: 15px; background: rgba(255,255,255,.85); color: #111;
+    }
+    #panel button.active { background: #00c2ff; color: #fff; }
+  </style>
+</head>
+<body>
+
+<div id="start">
+  <h2>WebAR: размещение объекта</h2>
+  <p id="status">Загрузка Three.js...</p>
+  <button id="startBtn" disabled>Запустить AR</button>
+</div>
+
+<div id="overlay">
+  <div id="hint">Медленно поводите камерой над полом или столом</div>
+  <div id="panel">
+    <button class="obj active" data-type="cube">Куб</button>
+    <button class="obj" data-type="chair">Стул</button>
+    <button class="obj" data-type="table">Стол</button>
+    <button id="clearBtn">Очистить</button>
+    <button id="exitBtn">Выйти</button>
+  </div>
+</div>
+
+<script type="module">
+  // ---------- Загрузка Three.js с запасными источниками ----------
+  // Важно: для локального файла нужен префикс "./", иначе браузер сочтёт путь именем пакета.
+  const THREE_URLS = [
+    './libs/three.module.js',
+    'https://unpkg.com/three@0.160.0/build/three.module.js',
+    'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js'
+  ];
+
+  async function loadThree() {
+    for (const url of THREE_URLS) {
+      try {
+        const mod = await import(url);
+        console.log('Three.js загружен:', url);
+        return mod;
+      } catch (e) {
+        console.warn('Не загрузилось:', url, e);
+      }
+    }
+    throw new Error('Three.js не загрузился ни с одного источника');
+  }
+
+  const startScreen = document.getElementById('start');
+  const startBtn = document.getElementById('startBtn');
+  const statusEl = document.getElementById('status');
+  const overlay = document.getElementById('overlay');
+  const hintEl = document.getElementById('hint');
+
+  const setStatus = (t) => { statusEl.textContent = t; };
+
+  async function main() {
+    let THREE;
+    try {
+      THREE = await loadThree();
+    } catch (e) {
+      setStatus('Не удалось загрузить Three.js. Положите three.module.js (версия 0.160.0) в папку libs/.');
+      return;
+    }
+
+    // ---------- Сцена, камера, рендерер ----------
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1.2));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(1, 3, 2);
+    scene.add(dirLight);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    // Пространство координат local-floor: начало координат на уровне пола,
+    // все позиции из hit-test считаются в нём
+    renderer.xr.setReferenceSpaceType('local-floor');
+    document.body.appendChild(renderer.domElement);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ---------- Визуальный маркер (кольцо + точка) ----------
+    const reticle = new THREE.Group();
+    reticle.matrixAutoUpdate = false;   // матрицу задаёт hit-test, а не Three.js
+    reticle.visible = false;
+
+    const reticleMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, side: THREE.DoubleSide });
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.13, 0.16, 40).rotateX(-Math.PI / 2), reticleMat);
+    const dot = new THREE.Mesh(new THREE.CircleGeometry(0.015, 16).rotateX(-Math.PI / 2), reticleMat);
+    reticle.add(ring, dot);
+    scene.add(reticle);
+
+    // ---------- Объекты: куб и мебель из примитивов (начало координат — центр основания) ----------
+    function makeShadowTexture() {
+      const c = document.createElement('canvas');
+      c.width = c.height = 128;
+      const g = c.getContext('2d');
+      const grad = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+      grad.addColorStop(0, 'rgba(0,0,0,0.45)');
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = grad;
+      g.fillRect(0, 0, 128, 128);
+      return new THREE.CanvasTexture(c);
+    }
+    const shadowTex = makeShadowTexture();
+
+    function addShadow(group, size) {
+      const shadow = new THREE.Mesh(
+        new THREE.PlaneGeometry(size, size).rotateX(-Math.PI / 2),
+        new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false })
+      );
+      shadow.position.y = 0.002;
+      group.add(shadow);
+    }
+
+    function box(w, h, d, x, y, z, mat) {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+      m.position.set(x, y, z);
+      return m;
+    }
+
+    function createObject(type) {
+      const g = new THREE.Group();
+
+      if (type === 'cube') {
+        const mat = new THREE.MeshStandardMaterial({ color: 0x00c2ff, roughness: 0.4 });
+        g.add(box(0.2, 0.2, 0.2, 0, 0.1, 0, mat));
+        addShadow(g, 0.5);
+      }
+
+      if (type === 'chair') {
+        const wood = new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.7 });
+        g.add(box(0.40, 0.04, 0.40, 0, 0.45, 0, wood));            // сиденье
+        g.add(box(0.40, 0.40, 0.04, 0, 0.67, -0.18, wood));        // спинка (сзади, перед смотрит в +Z)
+        [[-0.17, -0.17], [0.17, -0.17], [-0.17, 0.17], [0.17, 0.17]].forEach(([x, z]) => {
+          g.add(box(0.04, 0.43, 0.04, x, 0.215, z, wood));         // ножки
+        });
+        addShadow(g, 0.9);
+      }
+
+      if (type === 'table') {
+        const wood = new THREE.MeshStandardMaterial({ color: 0xc89b64, roughness: 0.6 });
+        g.add(box(1.0, 0.04, 0.6, 0, 0.74, 0, wood));              // столешница
+        [[-0.45, -0.25], [0.45, -0.25], [-0.45, 0.25], [0.45, 0.25]].forEach(([x, z]) => {
+          g.add(box(0.05, 0.72, 0.05, x, 0.36, z, wood));         // ножки
+        });
+        addShadow(g, 1.6);
+      }
+
+      return g;
+    }
+
+    // ---------- Размещение объекта ----------
+    let currentType = 'cube';
+    const placed = [];
+
+    function placeObject() {
+      if (!reticle.visible) return;
+
+      const pos = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scl = new THREE.Vector3();
+      reticle.matrix.decompose(pos, quat, scl);
+
+      const obj = createObject(currentType);
+      obj.position.copy(pos);
+
+      // На горизонтальной поверхности поворачиваем объект лицом к пользователю,
+      // на наклонной/вертикальной берём ориентацию из hit-test
+      const normal = new THREE.Vector3(0, 1, 0).applyQuaternion(quat);
+      if (normal.y > 0.8) {
+        const camPos = new THREE.Vector3();
+        renderer.xr.getCamera().getWorldPosition(camPos);
+        obj.rotation.y = Math.atan2(camPos.x - pos.x, camPos.z - pos.z);
+      } else {
+        obj.quaternion.copy(quat);
+      }
+
+      // Объект добавлен в scene (мировые координаты reference space), а не к камере,
+      // поэтому при движении камеры он остаётся на месте
+      scene.add(obj);
+      placed.push(obj);
+    }
+
+    function clearAll() {
+      placed.forEach(o => scene.remove(o));
+      placed.length = 0;
+    }
+
+    // тап по экрану в AR-сессии = событие select
+    const controller = renderer.xr.getController(0);
+    controller.addEventListener('select', placeObject);
+    scene.add(controller);
+
+    // ---------- Hit-test ----------
+    let hitTestSource = null;
+    let lastVisible = null;
+
+    renderer.xr.addEventListener('sessionstart', async () => {
+      const session = renderer.xr.getSession();
+      startScreen.style.display = 'none';
+      overlay.style.display = 'block';
+
+      try {
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+      } catch (e) {
+        console.error('Hit-test недоступен:', e);
+        hintEl.textContent = 'Hit-test недоступен на этом устройстве';
+      }
+    });
+
+    renderer.xr.addEventListener('sessionend', () => {
+      if (hitTestSource) { hitTestSource.cancel(); hitTestSource = null; }
+      reticle.visible = false;
+      lastVisible = null;
+      clearAll();
+      overlay.style.display = 'none';
+      startScreen.style.display = 'flex';
+    });
+
+    // ---------- Цикл отрисовки ----------
+    renderer.setAnimationLoop((timestamp, frame) => {
+      if (frame && hitTestSource) {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        const results = frame.getHitTestResults(hitTestSource);
+
+        let pose = null;
+        if (results.length > 0) pose = results[0].getPose(referenceSpace);
+
+        if (pose) {
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+        } else {
+          reticle.visible = false;
+        }
+
+        if (reticle.visible !== lastVisible) {
+          lastVisible = reticle.visible;
+          hintEl.textContent = reticle.visible
+            ? 'Нажмите на экран, чтобы поставить объект'
+            : 'Медленно поводите камерой над полом или столом';
+        }
+
+        // пульсация кольца
+        ring.scale.setScalar(1 + 0.08 * Math.sin(timestamp / 180));
+      }
+      renderer.render(scene, camera);
+    });
+
+    // ---------- Интерфейс ----------
+    // Нажатия на кнопки не должны ставить объект
+    overlay.addEventListener('beforexrselect', (e) => e.preventDefault());
+
+    document.querySelectorAll('.obj').forEach(btn => {
+      btn.addEventListener('click', () => {
+        currentType = btn.dataset.type;
+        document.querySelectorAll('.obj').forEach(b => b.classList.toggle('active', b === btn));
+      });
+    });
+    document.getElementById('clearBtn').addEventListener('click', clearAll);
+    document.getElementById('exitBtn').addEventListener('click', () => {
+      const s = renderer.xr.getSession();
+      if (s) s.end();
+    });
+
+    // ---------- Проверка поддержки и запуск AR-сессии ----------
+    if (!window.isSecureContext) {
+      setStatus('Нужен HTTPS (или localhost). Откройте страницу по https://');
+      return;
+    }
+    if (!('xr' in navigator)) {
+      setStatus('WebXR недоступен в этом браузере. Используйте Chrome на Android или WebXR Emulator на десктопе.');
+      return;
+    }
+
+    let supported = false;
+    try {
+      supported = await navigator.xr.isSessionSupported('immersive-ar');
+    } catch (e) {
+      console.error(e);
+    }
+    if (!supported) {
+      setStatus('Режим immersive-ar не поддерживается. Нужен Android с ARCore (Google Play Services for AR) и Chrome, либо WebXR Emulator.');
+      return;
+    }
+
+    setStatus('Готово. Нажмите кнопку и разрешите доступ к камере.');
+    startBtn.disabled = false;
+
+    startBtn.addEventListener('click', async () => {
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test'],
+          optionalFeatures: ['local-floor', 'dom-overlay'],
+          domOverlay: { root: overlay }
+        });
+        await renderer.xr.setSession(session);
+      } catch (e) {
+        console.error(e);
+        setStatus('Не удалось запустить AR-сессию: ' + e.message);
+      }
+    });
+  }
+
+  main();
+</script>
+
+</body>
+</html>
